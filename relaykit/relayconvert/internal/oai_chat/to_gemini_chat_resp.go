@@ -11,14 +11,15 @@ import (
 )
 
 type ChatToGeminiStreamState struct {
-	toolsByChoice   map[int][]*chatToGeminiStreamTool
-	toolByIndex     map[chatToGeminiStreamToolKey]*chatToGeminiStreamTool
-	toolByID        map[chatToGeminiStreamToolIDKey]*chatToGeminiStreamTool
-	finishedChoices map[int]bool
-	seenChoices     map[int]bool
-	usage           *dto.Usage
-	usageEmitted    bool
-	finalized       bool
+	toolsByChoice     map[int][]*chatToGeminiStreamTool
+	toolByIndex       map[chatToGeminiStreamToolKey]*chatToGeminiStreamTool
+	toolByID          map[chatToGeminiStreamToolIDKey]*chatToGeminiStreamTool
+	citationsByChoice map[int]*chatGeminiStreamCitations
+	finishedChoices   map[int]bool
+	seenChoices       map[int]bool
+	usage             *dto.Usage
+	usageEmitted      bool
+	finalized         bool
 }
 
 type chatToGeminiStreamToolKey struct {
@@ -40,11 +41,12 @@ type chatToGeminiStreamTool struct {
 
 func NewChatToGeminiStreamState() *ChatToGeminiStreamState {
 	return &ChatToGeminiStreamState{
-		toolsByChoice:   make(map[int][]*chatToGeminiStreamTool),
-		toolByIndex:     make(map[chatToGeminiStreamToolKey]*chatToGeminiStreamTool),
-		toolByID:        make(map[chatToGeminiStreamToolIDKey]*chatToGeminiStreamTool),
-		finishedChoices: make(map[int]bool),
-		seenChoices:     make(map[int]bool),
+		toolsByChoice:     make(map[int][]*chatToGeminiStreamTool),
+		toolByIndex:       make(map[chatToGeminiStreamToolKey]*chatToGeminiStreamTool),
+		toolByID:          make(map[chatToGeminiStreamToolIDKey]*chatToGeminiStreamTool),
+		citationsByChoice: make(map[int]*chatGeminiStreamCitations),
+		finishedChoices:   make(map[int]bool),
+		seenChoices:       make(map[int]bool),
 	}
 }
 
@@ -117,6 +119,9 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info convmeta
 		}
 
 		candidate.Content = content
+		if citations := chatAnnotationsToGeminiCitations(choice.Message.Annotations, textContent); len(citations) > 0 {
+			candidate.CitationMetadata = &dto.GeminiCitationMetadata{Citations: citations}
+		}
 		geminiResponse.Candidates = append(geminiResponse.Candidates, candidate)
 	}
 
@@ -254,6 +259,9 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 	if s.seenChoices == nil {
 		s.seenChoices = make(map[int]bool)
 	}
+	if s.citationsByChoice == nil {
+		s.citationsByChoice = make(map[int]*chatGeminiStreamCitations)
+	}
 	if openAIResponse.Usage != nil {
 		s.usage = UsageFromChatUsage(openAIResponse.Usage)
 	}
@@ -264,9 +272,21 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 		hasText := choice.Delta.GetContentString() != ""
 		hasToolDelta := len(choice.Delta.ToolCalls) > 0
 		hasFinish := choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != ""
+		hasAnnotations := len(choice.Delta.Annotations) > 0
+		citationState := s.choiceCitations(choice.Index)
 		if s.finishedChoices[choice.Index] {
 			if hasText || hasToolDelta {
 				return nil, fmt.Errorf("OpenAI chat choice %d received data after completion", choice.Index)
+			}
+			// Citations can arrive in annotation-only deltas after the
+			// finish reason. The answer text is complete, so each range is
+			// locatable now or skipped; the response text is unaffected.
+			if hasAnnotations {
+				resolved := citationState.ingest(choice.Delta.Annotations, false)
+				resolved = append(resolved, citationState.finish()...)
+				if len(resolved) > 0 {
+					candidates = append(candidates, newGeminiStreamCitationCandidate(choice.Index, resolved))
+				}
 			}
 			continue
 		}
@@ -288,8 +308,19 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 				Parts: make([]dto.GeminiPart, 0),
 			},
 		}
+		var resolvedCitations []dto.GeminiCitation
 		if hasText {
-			candidate.Content.Parts = append(candidate.Content.Parts, dto.GeminiPart{Text: choice.Delta.GetContentString()})
+			text := choice.Delta.GetContentString()
+			citationState.appendText(text)
+			candidate.Content.Parts = append(candidate.Content.Parts, dto.GeminiPart{Text: text})
+		}
+		if hasAnnotations {
+			// The choice may finish later: keep ranges beyond the text seen
+			// so far buffered until they can point at the right characters.
+			resolvedCitations = citationState.ingest(choice.Delta.Annotations, true)
+		}
+		if hasText {
+			resolvedCitations = append(resolvedCitations, citationState.flushBuffered()...)
 		}
 		if hasFinish {
 			parts, err := s.finishChoice(choice.Index)
@@ -300,8 +331,14 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 			finishReason := geminiFinishReason(*choice.FinishReason)
 			candidate.FinishReason = &finishReason
 			s.finishedChoices[choice.Index] = true
+			// The answer text is final: emit the rest of the locatable
+			// citations and discard ranges the upstream never sent.
+			resolvedCitations = append(resolvedCitations, citationState.finish()...)
 		}
-		if len(candidate.Content.Parts) > 0 || candidate.FinishReason != nil {
+		if len(resolvedCitations) > 0 {
+			candidate.CitationMetadata = &dto.GeminiCitationMetadata{Citations: resolvedCitations}
+		}
+		if len(candidate.Content.Parts) > 0 || candidate.FinishReason != nil || candidate.CitationMetadata != nil {
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -353,7 +390,7 @@ func (s *ChatToGeminiStreamState) Finalize(info convmeta.Meta) ([]*dto.GeminiCha
 			return nil, err
 		}
 		finishReason := "STOP"
-		candidates = append(candidates, dto.GeminiChatCandidate{
+		candidate := dto.GeminiChatCandidate{
 			Index:         int64(choiceIndex),
 			FinishReason:  &finishReason,
 			SafetyRatings: []dto.GeminiChatSafetyRating{},
@@ -361,7 +398,13 @@ func (s *ChatToGeminiStreamState) Finalize(info convmeta.Meta) ([]*dto.GeminiCha
 				Role:  "model",
 				Parts: parts,
 			},
-		})
+		}
+		if citationState := s.citationsByChoice[choiceIndex]; citationState != nil {
+			if citations := citationState.finish(); len(citations) > 0 {
+				candidate.CitationMetadata = &dto.GeminiCitationMetadata{Citations: citations}
+			}
+		}
+		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		s.finalized = true
@@ -471,6 +514,28 @@ func (s *ChatToGeminiStreamState) finishChoice(choiceIndex int) ([]dto.GeminiPar
 		tool.Emitted = true
 	}
 	return parts, nil
+}
+
+// choiceCitations returns the per-choice citation tracker that keeps answer
+// text and url_citation annotations aligned across streamed chunks.
+func (s *ChatToGeminiStreamState) choiceCitations(choiceIndex int) *chatGeminiStreamCitations {
+	citations := s.citationsByChoice[choiceIndex]
+	if citations == nil {
+		citations = &chatGeminiStreamCitations{seen: make(map[string]struct{})}
+		s.citationsByChoice[choiceIndex] = citations
+	}
+	return citations
+}
+
+// newGeminiStreamCitationCandidate builds a citation-only streamed candidate
+// emitted when the upstream delivers annotations after the answer text.
+func newGeminiStreamCitationCandidate(choiceIndex int, citations []dto.GeminiCitation) dto.GeminiChatCandidate {
+	return dto.GeminiChatCandidate{
+		Index:            int64(choiceIndex),
+		SafetyRatings:    []dto.GeminiChatSafetyRating{},
+		Content:          dto.GeminiChatContent{Role: "model", Parts: make([]dto.GeminiPart, 0)},
+		CitationMetadata: &dto.GeminiCitationMetadata{Citations: citations},
+	}
 }
 
 func newGeminiStreamResponse(candidates []dto.GeminiChatCandidate, usage *dto.Usage, info convmeta.Meta) *dto.GeminiChatResponse {

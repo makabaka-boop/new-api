@@ -528,6 +528,21 @@ type GeminiChatCandidate struct {
 	Index             int64                    `json:"index"`
 	SafetyRatings     []GeminiChatSafetyRating `json:"safetyRatings"`
 	GroundingMetadata *GeminiGroundingMetadata `json:"groundingMetadata,omitempty"`
+	CitationMetadata  *GeminiCitationMetadata  `json:"citationMetadata,omitempty"`
+}
+
+// GeminiCitationMetadata attaches source citations to a candidate. The
+// offsets are Unicode code-point indices into the candidate text.
+type GeminiCitationMetadata struct {
+	Citations []GeminiCitation `json:"citations,omitempty"`
+}
+
+type GeminiCitation struct {
+	StartIndex *int   `json:"startIndex,omitempty"`
+	EndIndex   *int   `json:"endIndex,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	Title      string `json:"title,omitempty"`
+	License    string `json:"license,omitempty"`
 }
 
 type GeminiGroundingMetadata struct {
