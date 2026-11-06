@@ -55,6 +55,104 @@ func TestChannelPriorityPlan(t *testing.T) {
 	assert.ErrorIs(t, err, ErrChannelPriorityInvalid)
 }
 
+func priorityTestPtr(v int64) *int64 {
+	return &v
+}
+
+func TestChannelPriorityRoutePlan(t *testing.T) {
+	ability := func(group, model string, id int, enabled bool, priority *int64) Ability {
+		return Ability{Group: group, Model: model, ChannelId: id, Enabled: enabled, Priority: priority}
+	}
+	change := func(id int, previous, priority *int64) ChannelPriorityChange {
+		return ChannelPriorityChange{ID: id, Previous: previous, Priority: priority}
+	}
+	tier := func(priority int64, ids ...int) ChannelPriorityRouteTier {
+		return ChannelPriorityRouteTier{Priority: priority, Channels: ids}
+	}
+	for _, tc := range []struct {
+		name      string
+		abilities []Ability
+		changes   []ChannelPriorityChange
+		want      []ChannelPriorityRouteChange
+	}{
+		{
+			name: "channel crosses tiers across two groups, sorted by group then model",
+			abilities: []Ability{
+				ability("g1", "m1", 1, true, priorityTestPtr(100)),
+				ability("g1", "m1", 2, true, priorityTestPtr(50)),
+				ability("g1", "m1", 3, true, priorityTestPtr(0)),
+				ability("g0", "m1", 1, true, priorityTestPtr(100)),
+				ability("g0", "m1", 2, true, priorityTestPtr(50)),
+				ability("g0", "m1", 3, true, priorityTestPtr(0)),
+			},
+			changes: []ChannelPriorityChange{change(3, priorityTestPtr(0), priorityTestPtr(75))},
+			want: []ChannelPriorityRouteChange{
+				{
+					Group: "g0", Model: "m1",
+					Before: []ChannelPriorityRouteTier{tier(100, 1), tier(50, 2), tier(0, 3)},
+					After:  []ChannelPriorityRouteTier{tier(100, 1), tier(75, 3), tier(50, 2)},
+				},
+				{
+					Group: "g1", Model: "m1",
+					Before: []ChannelPriorityRouteTier{tier(100, 1), tier(50, 2), tier(0, 3)},
+					After:  []ChannelPriorityRouteTier{tier(100, 1), tier(75, 3), tier(50, 2)},
+				},
+			},
+		},
+		{
+			name: "gap renumbering with identical tier membership is not reported",
+			abilities: []Ability{
+				ability("g1", "neutral", 1, true, priorityTestPtr(100)),
+				ability("g1", "neutral", 2, true, priorityTestPtr(99)),
+				ability("g1", "neutral", 3, true, priorityTestPtr(99)),
+			},
+			changes: []ChannelPriorityChange{change(1, priorityTestPtr(100), priorityTestPtr(101))},
+			want:    nil,
+		},
+		{
+			name: "preferred tier splits and merges into the backup tier",
+			abilities: []Ability{
+				ability("g3", "m3", 1, true, priorityTestPtr(10)),
+				ability("g3", "m3", 2, true, priorityTestPtr(10)),
+				ability("g3", "m3", 3, true, priorityTestPtr(0)),
+			},
+			changes: []ChannelPriorityChange{change(2, priorityTestPtr(10), priorityTestPtr(0))},
+			want: []ChannelPriorityRouteChange{{
+				Group: "g3", Model: "m3",
+				Before: []ChannelPriorityRouteTier{tier(10, 1, 2), tier(0, 3)},
+				After:  []ChannelPriorityRouteTier{tier(10, 1), tier(0, 2, 3)},
+			}},
+		},
+		{
+			name: "NULL and zero priority share one effective tier",
+			abilities: []Ability{
+				ability("g4", "m4", 1, true, nil),
+				ability("g4", "m4", 2, true, priorityTestPtr(0)),
+				ability("g4", "m4", 3, true, nil),
+			},
+			changes: []ChannelPriorityChange{change(3, nil, priorityTestPtr(50))},
+			want: []ChannelPriorityRouteChange{{
+				Group: "g4", Model: "m4",
+				Before: []ChannelPriorityRouteTier{tier(0, 1, 2, 3)},
+				After:  []ChannelPriorityRouteTier{tier(50, 3), tier(0, 1, 2)},
+			}},
+		},
+		{
+			name: "disabled abilities never participate in tiers",
+			abilities: []Ability{
+				ability("g2", "off", 1, false, priorityTestPtr(100)),
+				ability("g2", "off", 3, false, priorityTestPtr(0)),
+			},
+			changes: []ChannelPriorityChange{change(1, priorityTestPtr(100), priorityTestPtr(50))},
+			want:    nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, planChannelPriorityRouteChanges(tc.abilities, tc.changes))
+		})
+	}
+}
+
 func TestChannelPriorityDatabaseMatrix(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -113,12 +211,48 @@ func TestChannelPriorityDatabaseMatrix(t *testing.T) {
 					require.NoError(t, db.Create(&Ability{Group: group, Model: "test", ChannelId: channel.Id, Priority: channel.Priority, Weight: uint(*channel.Weight), Enabled: true}).Error)
 				}
 			}
+			// Route-preview fixtures: "neutral" only suffers gap renumbering
+			// (tier membership stays identical) and "off" is fully disabled.
+			for _, index := range []int{0, 1, 2} {
+				require.NoError(t, db.Create(&Ability{Group: "default", Model: "neutral", ChannelId: channels[index].Id, Priority: channels[index].Priority, Enabled: true}).Error)
+			}
+			for _, channel := range channels {
+				require.NoError(t, db.Create(&Ability{Group: "default", Model: "off", ChannelId: channel.Id, Priority: channel.Priority, Enabled: false}).Error)
+			}
 			initial, err := GetChannelPriorityOrder()
 			require.NoError(t, err)
 			move := ChannelPriorityMove{Revision: initial.Revision, ID: channels[3].Id, TargetID: channels[1].Id, Position: "before", Preview: true}
 			preview, err := ReorderChannelPriority(move)
 			require.NoError(t, err)
 			require.Len(t, preview.Changes, 2)
+			assert.Nil(t, preview.Routes, "route tiers are only included when requested")
+			assert.Nil(t, preview.ChannelNames)
+			move.Routes = true
+			detailed, err := ReorderChannelPriority(move)
+			require.NoError(t, err)
+			move.Routes = false
+			require.Len(t, detailed.Routes, 2, "only the two enabled (group, model) test routes change")
+			assert.Equal(t, ChannelPriorityRouteChange{
+				Group: "default", Model: "test",
+				Before: []ChannelPriorityRouteTier{
+					{Priority: 100, Channels: []int{channels[0].Id}},
+					{Priority: 99, Channels: []int{channels[1].Id, channels[2].Id}},
+					{Priority: 0, Channels: []int{channels[3].Id}},
+				},
+				After: []ChannelPriorityRouteTier{
+					{Priority: 101, Channels: []int{channels[0].Id}},
+					{Priority: 100, Channels: []int{channels[3].Id}},
+					{Priority: 99, Channels: []int{channels[1].Id, channels[2].Id}},
+				},
+			}, detailed.Routes[0])
+			assert.Equal(t, "second", detailed.Routes[1].Group)
+			assert.Equal(t, "test", detailed.Routes[1].Model)
+			for _, route := range detailed.Routes {
+				assert.NotEqual(t, "neutral", route.Model)
+				assert.NotEqual(t, "off", route.Model)
+			}
+			require.Len(t, detailed.ChannelNames, 4, "names cover every channel in the diff, including ones outside any page")
+			assert.Equal(t, "moving", detailed.ChannelNames[channels[3].Id])
 			unchanged, err := GetChannelPriorityOrder()
 			require.NoError(t, err)
 			assert.Equal(t, initial, unchanged, "preview does not persist")
@@ -128,7 +262,7 @@ func TestChannelPriorityDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, preview, applied)
 			for _, change := range applied.Changes {
 				var abilities []Ability
-				require.NoError(t, db.Where("channel_id = ?", change.ID).Find(&abilities).Error)
+				require.NoError(t, db.Where("channel_id = ? AND model = ?", change.ID, "test").Find(&abilities).Error)
 				require.Len(t, abilities, 2)
 				for _, ability := range abilities {
 					assert.Equal(t, change.Priority, ability.Priority)

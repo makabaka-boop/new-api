@@ -159,7 +159,9 @@ export function ChannelPriorityGuide(props: {
         ))}
       </Tabs>
       <p className='text-muted-foreground mt-3 border-t pt-3 text-xs leading-5'>
-        {t('Changes save on drop. You can undo the last move.')}
+        {t(
+          'Review routing changes and confirm to save. You can undo the last move.'
+        )}
       </p>
     </Dialog>
   )

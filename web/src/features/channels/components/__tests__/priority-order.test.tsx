@@ -32,6 +32,7 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { api, type ApiRequestConfig } from '@/lib/api'
@@ -68,6 +69,61 @@ const applied: PriorityOrder = {
 let current: PriorityOrder
 let requests: PriorityMove[]
 let failSave: boolean
+let failRoutesPreview: boolean
+let emptyRoutes: boolean
+
+const routePreviewFor = (move: PriorityMove): PriorityOrder['routes'] => {
+  if (move.position === 'same') {
+    return [
+      {
+        group: 'default',
+        model: 'test-model',
+        before: [
+          { priority: 100, channels: [1] },
+          { priority: 80, channels: [2] },
+          { priority: 0, channels: [3] },
+        ],
+        after: [
+          { priority: 100, channels: [1] },
+          { priority: 80, channels: [2, 3] },
+        ],
+      },
+    ]
+  }
+  return [
+    {
+      group: 'default',
+      model: 'test-model',
+      before: [
+        { priority: 100, channels: [1] },
+        { priority: 80, channels: [2] },
+        { priority: 0, channels: [3] },
+      ],
+      after: [
+        { priority: 100, channels: [1] },
+        { priority: 90, channels: [3] },
+        { priority: 80, channels: [2] },
+      ],
+    },
+    {
+      // A channel that is not loaded on the current page still renders by name.
+      group: 'vip',
+      model: 'other-model',
+      before: [
+        { priority: 100, channels: [99] },
+        { priority: 0, channels: [3] },
+      ],
+      after: [{ priority: 100, channels: [99, 3] }],
+    },
+  ]
+}
+
+const routeChannelNames: Record<string, string> = {
+  '1': 'Channel 1',
+  '2': 'Channel 2',
+  '3': 'Channel 3',
+  '99': 'Channel 99',
+}
 const pointerMethods = [
   'setPointerCapture',
   'releasePointerCapture',
@@ -111,6 +167,8 @@ beforeEach(() => {
   current = initial
   requests = []
   failSave = false
+  failRoutesPreview = false
+  emptyRoutes = false
   localStorage.clear()
   for (const key of Object.values(CHANNEL_PRIORITY_GUIDE_KEYS)) {
     localStorage.setItem(key, 'seen')
@@ -157,6 +215,14 @@ beforeEach(() => {
     }
     const move = body as PriorityMove
     requests.push(move)
+    if (failRoutesPreview && move.preview && move.routes) {
+      return {
+        data: {
+          success: false,
+          message: 'Channel priorities changed. Refresh and try again.',
+        },
+      }
+    }
     if (failSave && !move.preview) {
       return {
         data: {
@@ -177,10 +243,25 @@ beforeEach(() => {
     let result = applied
     if (move.restore) result = initial
     else if (move.position === 'same') result = joined
+    if (move.routes) {
+      result = {
+        ...result,
+        routes: emptyRoutes ? [] : routePreviewFor(move),
+        channel_names: routeChannelNames,
+      }
+    }
     if (!move.preview) current = result
     return { data: { success: true, data: result } }
   })
 })
+
+async function confirmPendingChange() {
+  const dialog = within(await screen.findByRole('dialog'))
+  const save = await dialog.findByRole('button', { name: 'Save changes' })
+  await waitFor(() => expect(save).toBeEnabled())
+  await userEvent.setup().click(save)
+  await screen.findByRole('button', { name: 'Undo' })
+}
 
 async function mount(view: 'table' | 'card' = 'card', enabled = true) {
   localStorage.setItem('channels:view-mode', view)
@@ -258,7 +339,7 @@ test.each(['table', 'card'] as const)(
 )
 
 test.each(['table', 'card'] as const)(
-  '%s keyboard reorder saves priority and undo restores it',
+  '%s keyboard reorder previews routes, saves on confirm and undo restores it',
   async (view) => {
     await mount(view)
     const user = userEvent.setup()
@@ -266,7 +347,20 @@ test.each(['table', 'card'] as const)(
       screen.getByRole('button', { name: 'Reorder channel 3' }),
       { key: 'ArrowUp' }
     )
-    await screen.findByRole('button', { name: 'Undo' })
+    await screen.findByRole('dialog')
+    await waitFor(() =>
+      expect(requests).toContainEqual({
+        id: 3,
+        target_id: 2,
+        position: 'before',
+        revision: 'initial',
+        preview: true,
+        routes: true,
+      })
+    )
+    expect(requests.filter((request) => !request.preview)).toEqual([])
+    expect(orderInView()).toEqual(['channel:1', 'channel:2', 'channel:3'])
+    await confirmPendingChange()
     await waitFor(() =>
       expect(orderInView()).toEqual(['channel:1', 'channel:3', 'channel:2'])
     )
@@ -306,20 +400,127 @@ test('switching sort exits reorder mode without automatically reopening it', asy
   expect(requests).toEqual([])
 })
 
-test('failed save restores the visible order and does not offer undo', async () => {
+test('a failed save keeps the original order, shows the reason and offers no undo', async () => {
+  const toastError = vi.spyOn(toast, 'error').mockImplementation(() => '')
   failSave = true
   await mount()
   fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
     key: 'ArrowUp',
   })
-  await waitFor(() => expect(requests).toHaveLength(1))
+  const dialog = within(await screen.findByRole('dialog'))
+  await userEvent
+    .setup()
+    .click(await dialog.findByRole('button', { name: 'Save changes' }))
   await waitFor(() =>
-    expect(
-      screen.getByRole('button', { name: 'Reorder channel 3' })
-    ).toBeEnabled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await waitFor(() =>
+    expect(toastError).toHaveBeenCalledWith(
+      'Channel priorities changed. Refresh and try again.'
+    )
   )
   expect(orderInView()).toEqual(['channel:1', 'channel:2', 'channel:3'])
   expect(screen.queryByRole('button', { name: 'Undo' })).not.toBeInTheDocument()
+  toastError.mockRestore()
+})
+
+test('a failed routing preview keeps the original order and explains the failure', async () => {
+  const toastError = vi.spyOn(toast, 'error').mockImplementation(() => '')
+  failRoutesPreview = true
+  await mount()
+  fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
+    key: 'ArrowUp',
+  })
+  await waitFor(() =>
+    expect(toastError).toHaveBeenCalledWith(
+      'Channel priorities changed. Refresh and try again.'
+    )
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  expect(requests.filter((request) => !request.preview)).toEqual([])
+  expect(orderInView()).toEqual(['channel:1', 'channel:2', 'channel:3'])
+  toastError.mockRestore()
+})
+
+test('cancelling the routing preview keeps the original order and saves nothing', async () => {
+  await mount()
+  fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
+    key: 'ArrowUp',
+  })
+  const dialog = within(await screen.findByRole('dialog'))
+  await userEvent
+    .setup()
+    .click(await dialog.findByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  expect(requests.filter((request) => !request.preview)).toEqual([])
+  expect(orderInView()).toEqual(['channel:1', 'channel:2', 'channel:3'])
+  expect(screen.queryByRole('button', { name: 'Undo' })).not.toBeInTheDocument()
+})
+
+test('the routing preview lists tiers per group and model and names off-page channels', async () => {
+  await mount('table')
+  fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
+    key: 'ArrowUp',
+  })
+  const dialog = within(await screen.findByRole('dialog'))
+  expect(
+    await dialog.findByText('2 routing combinations affected')
+  ).toBeInTheDocument()
+  expect(dialog.getByText('test-model')).toBeInTheDocument()
+  expect(dialog.getByText('other-model')).toBeInTheDocument()
+  // Preferred and backup tiers are labelled, with channels grouped in one tier.
+  expect(dialog.getAllByText('Preferred').length).toBeGreaterThan(0)
+  expect(dialog.getAllByText(/Backup/).length).toBeGreaterThan(0)
+  // Off-page channel renders by the server-provided name in both columns.
+  expect(dialog.getAllByText('Channel 99').length).toBeGreaterThan(0)
+  // Moved channel badges are highlighted in the after column.
+  const movedNames = dialog.getAllByText('Channel 3')
+  expect(
+    movedNames.some((element) => element.closest('.border-warning'))
+  ).toBe(true)
+  await userEvent
+    .setup()
+    .click(await dialog.findByRole('button', { name: 'Cancel' }))
+})
+
+test('the routing preview masks group and channel names while models stay visible', async () => {
+  await mount('table')
+  await userEvent.setup().click(screen.getByRole('button', { name: /^Hide$/ }))
+  fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
+    key: 'ArrowUp',
+  })
+  const dialog = within(await screen.findByRole('dialog'))
+  await dialog.findByText('test-model')
+  expect(dialog.queryByText('Channel 3')).not.toBeInTheDocument()
+  expect(dialog.queryByText('Channel 99')).not.toBeInTheDocument()
+  expect(dialog.queryByText('default')).not.toBeInTheDocument()
+  expect(dialog.getAllByText('••••').length).toBeGreaterThan(0)
+  expect(dialog.getByText('test-model')).toBeInTheDocument()
+  expect(dialog.getByText('other-model')).toBeInTheDocument()
+})
+
+test('a route-neutral move shows the empty state and cannot be saved', async () => {
+  emptyRoutes = true
+  await mount()
+  fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
+    key: 'ArrowUp',
+  })
+  const dialog = within(await screen.findByRole('dialog'))
+  expect(await dialog.findByText('No routing changes')).toBeInTheDocument()
+  expect(
+    dialog.queryByRole('button', { name: 'Save changes' })
+  ).not.toBeInTheDocument()
+  await userEvent
+    .setup()
+    .click(await dialog.findByRole('button', { name: 'Done' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  expect(requests.filter((request) => !request.preview)).toEqual([])
 })
 
 test('card and table views share the saved order', async () => {
@@ -328,7 +529,7 @@ test('card and table views share the saved order', async () => {
   fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder channel 3' }), {
     key: 'ArrowUp',
   })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   const views = within(screen.getByRole('group', { name: 'View mode' }))
   views.getByRole('button', { name: 'Card view' }).focus()
   await user.tab()
@@ -439,7 +640,7 @@ test.each([
       clientY: jitterY,
     })
     fireEvent.pointerUp(scope, { pointerId: 1, clientX: 20, clientY: jitterY })
-    await screen.findByRole('button', { name: 'Undo' })
+    await confirmPendingChange()
     expect(requests.filter((request) => !request.preview)).toEqual([
       { id: 3, target_id: 2, position, revision: 'initial' },
     ])
@@ -488,7 +689,7 @@ test('table targets stay in place and the compact preview leaves the target rows
   fireEvent.pointerMove(scope, { pointerId: 1, clientX: 20, clientY: 190 })
   await screen.findByText('Release to join priority 80')
   fireEvent.pointerUp(scope, { pointerId: 1, clientX: 20, clientY: 190 })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   expect(requests.filter((request) => !request.preview)).toEqual([
     { id: 3, target_id: 2, position: 'same', revision: 'initial' },
   ])
@@ -519,6 +720,7 @@ test('dropping below the table rows cancels instead of selecting a distant row',
   await waitFor(() =>
     expect(document.querySelector('[data-origin-x]')).not.toBeInTheDocument()
   )
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   expect(requests.filter((request) => !request.preview)).toEqual([])
 })
 
@@ -533,7 +735,7 @@ test('a card alone on the last grid row still uses horizontal edge targets', asy
   fireEvent.pointerMove(scope, { pointerId: 1, clientX: 340, clientY: 150 })
   await screen.findByText('Release to insert a new priority tier')
   fireEvent.pointerUp(scope, { pointerId: 1, clientX: 340, clientY: 150 })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   expect(requests.filter((request) => !request.preview)).toEqual([
     { id: 3, target_id: 2, position: 'before', revision: 'initial' },
   ])
@@ -553,7 +755,7 @@ test('a quick card pointer drag saves even when released before an animation fra
   fireEvent.pointerMove(scope, { pointerId: 1, clientX: 340, clientY: 150 })
   fireEvent.pointerUp(scope, { pointerId: 1, clientX: 340, clientY: 150 })
   fireEvent.lostPointerCapture(scope, { pointerId: 1 })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   expect(requests.filter((request) => !request.preview)).toEqual([
     { id: 3, target_id: 2, position: 'before', revision: 'initial' },
   ])
@@ -600,7 +802,7 @@ test('moving from a card edge to its center joins the tier despite the moving pl
   expect(requests.every((request) => request.preview)).toBe(true)
   fireEvent.pointerMove(scope, { pointerId: 1, clientX: 470, clientY: 150 })
   fireEvent.pointerUp(scope, { pointerId: 1, clientX: 470, clientY: 150 })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   expect(requests.filter((request) => !request.preview)).toEqual([
     { id: 3, target_id: 2, position: 'same', revision: 'initial' },
   ])
@@ -785,7 +987,7 @@ test('dropping onto a card that moved into the original slot joins its priority 
     document.querySelector('[data-sortable-id="channel:2"]')
   ).toHaveAttribute('data-priority-drop', 'same')
   fireEvent.pointerUp(scope, { pointerId: 1, clientX: 790, clientY: 150 })
-  await screen.findByRole('button', { name: 'Undo' })
+  await confirmPendingChange()
   expect(requests.filter((request) => !request.preview)).toEqual([
     { id: 3, target_id: 2, position: 'same', revision: 'initial' },
   ])

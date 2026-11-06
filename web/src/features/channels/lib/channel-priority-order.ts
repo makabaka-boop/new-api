@@ -29,14 +29,28 @@ export type PriorityChange = {
   previous: number | null
   priority: number | null
 }
+export type PriorityRouteTier = {
+  priority: number
+  channels: number[]
+}
+export type PriorityRouteChange = {
+  group: string
+  model: string
+  before: PriorityRouteTier[]
+  after: PriorityRouteTier[]
+}
 export type PriorityOrder = {
   revision: string
   items: { id: number; priority: number | null }[]
   changes: PriorityChange[]
+  // Present only on previews requested with `routes: true`.
+  routes?: PriorityRouteChange[]
+  channel_names?: Record<string, string>
 }
 export type PriorityMove = Partial<PriorityDrop> & {
   revision: string
   preview?: boolean
+  routes?: boolean
   restore?: PriorityChange[]
 }
 

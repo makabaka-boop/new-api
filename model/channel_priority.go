@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/QuantumNous/new-api/common"
@@ -35,10 +36,31 @@ type ChannelPriorityChange struct {
 	Priority *int64 `json:"priority"`
 }
 
+// ChannelPriorityRouteTier is one priority tier of a (group, model) route.
+// Channels inside a tier share routing order (weighted random selection);
+// rank zero is the preferred tier, later ranks are backup tiers.
+type ChannelPriorityRouteTier struct {
+	Priority int64 `json:"priority"`
+	Channels []int `json:"channels"`
+}
+
+// ChannelPriorityRouteChange holds the before/after tier layout of one
+// (group, model) combination whose tier membership or tier order changed.
+type ChannelPriorityRouteChange struct {
+	Group  string                     `json:"group"`
+	Model  string                     `json:"model"`
+	Before []ChannelPriorityRouteTier `json:"before"`
+	After  []ChannelPriorityRouteTier `json:"after"`
+}
+
 type ChannelPriorityOrder struct {
 	Revision string                  `json:"revision"`
 	Items    []ChannelPriority       `json:"items"`
 	Changes  []ChannelPriorityChange `json:"changes"`
+	// Routes and ChannelNames are only populated for previews that ask for the
+	// routing impact of the move (move.Routes).
+	Routes       []ChannelPriorityRouteChange `json:"routes,omitempty"`
+	ChannelNames map[int]string               `json:"channel_names,omitempty"`
 }
 
 type ChannelPriorityMove struct {
@@ -47,6 +69,7 @@ type ChannelPriorityMove struct {
 	TargetID int                     `json:"target_id"`
 	Position string                  `json:"position"` // before / after use descending priority order
 	Preview  bool                    `json:"preview"`
+	Routes   bool                    `json:"routes"` // include before/after routing tiers in a preview response
 	Restore  []ChannelPriorityChange `json:"restore,omitempty"`
 }
 
@@ -99,10 +122,183 @@ func ReorderChannelPriority(move ChannelPriorityMove) (ChannelPriorityOrder, err
 				return err
 			}
 		}
+		if move.Preview && move.Routes && len(changes) > 0 {
+			routes, names, err := buildChannelPriorityRouteChanges(tx, changes)
+			if err != nil {
+				return err
+			}
+			result.Routes = routes
+			result.ChannelNames = names
+		}
 		result.Revision = channelPriorityRevision(result.Items)
 		return nil
 	})
 	return result, err
+}
+
+// buildChannelPriorityRouteChanges compares the enabled routing tiers of every
+// (group, model) combination before and after the planned priority changes.
+// Only combinations whose ordered tier membership changes are returned, along
+// with names of the channels they contain (including channels outside the
+// console's current page). The query is read-only and runs inside the move
+// transaction so the routing rows match the revision snapshot.
+func buildChannelPriorityRouteChanges(tx *gorm.DB, changes []ChannelPriorityChange) ([]ChannelPriorityRouteChange, map[int]string, error) {
+	// Full struct scan lets GORM quote the reserved "group" column itself and
+	// stays identical across SQLite, MySQL and PostgreSQL.
+	var abilities []Ability
+	if err := tx.Where("enabled = ?", true).Find(&abilities).Error; err != nil {
+		return nil, nil, err
+	}
+	routes := planChannelPriorityRouteChanges(abilities, changes)
+	if len(routes) == 0 {
+		return nil, nil, nil
+	}
+	idSet := make(map[int]struct{})
+	for _, route := range routes {
+		for _, tier := range route.Before {
+			for _, id := range tier.Channels {
+				idSet[id] = struct{}{}
+			}
+		}
+		for _, tier := range route.After {
+			for _, id := range tier.Channels {
+				idSet[id] = struct{}{}
+			}
+		}
+	}
+	ids := make([]int, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	var nameRows []struct {
+		ID   int    `gorm:"column:id"`
+		Name string `gorm:"column:name"`
+	}
+	if err := tx.Model(&Channel{}).Select("id", "name").Where("id IN ?", ids).Scan(&nameRows).Error; err != nil {
+		return nil, nil, err
+	}
+	names := make(map[int]string, len(nameRows))
+	for _, row := range nameRows {
+		names[row.ID] = row.Name
+	}
+	return routes, names, nil
+}
+
+// planChannelPriorityRouteChanges is the pure tier-diff used by the preview.
+// Enabled abilities describe the current routing; changes override channel
+// priorities in memory. A combination is reported only when the number of
+// tiers or the sorted channel set of any tier differs.
+func planChannelPriorityRouteChanges(abilities []Ability, changes []ChannelPriorityChange) []ChannelPriorityRouteChange {
+	type routeKey struct {
+		group string
+		model string
+	}
+	current := make(map[routeKey]map[int]*int64)
+	for _, ability := range abilities {
+		key := routeKey{ability.Group, ability.Model}
+		if current[key] == nil {
+			current[key] = make(map[int]*int64)
+		}
+		current[key][ability.ChannelId] = ability.Priority
+	}
+	overrides := make(map[int]*int64, len(changes))
+	for i := range changes {
+		overrides[changes[i].ID] = changes[i].Priority
+	}
+	keys := make([]routeKey, 0, len(current))
+	for key := range current {
+		keys = append(keys, key)
+	}
+	slices.SortFunc(keys, func(a, b routeKey) int {
+		if a.group != b.group {
+			if a.group < b.group {
+				return -1
+			}
+			return 1
+		}
+		if a.model < b.model {
+			return -1
+		}
+		if a.model > b.model {
+			return 1
+		}
+		return 0
+	})
+	var routes []ChannelPriorityRouteChange
+	for _, key := range keys {
+		beforeChannels := current[key]
+		afterChannels := make(map[int]*int64, len(beforeChannels))
+		for id, priority := range beforeChannels {
+			if next, ok := overrides[id]; ok {
+				value := int64(0)
+				if next != nil {
+					value = *next
+				}
+				afterChannels[id] = &value
+				continue
+			}
+			value := int64(0)
+			if priority != nil {
+				value = *priority
+			}
+			afterChannels[id] = &value
+		}
+		before := channelPriorityTiers(beforeChannels)
+		after := channelPriorityTiers(afterChannels)
+		if !channelPriorityTiersEqual(before, after) {
+			routes = append(routes, ChannelPriorityRouteChange{
+				Group:  key.group,
+				Model:  key.model,
+				Before: before,
+				After:  after,
+			})
+		}
+	}
+	return routes
+}
+
+// channelPriorityTiers groups channels by effective priority (NULL acts as
+// zero, matching GetPriority and the in-memory routing cache), ordered from
+// the preferred tier to backup tiers. Channel ids inside a tier are sorted.
+func channelPriorityTiers(byChannel map[int]*int64) []ChannelPriorityRouteTier {
+	levels := make(map[int64][]int)
+	for id, priority := range byChannel {
+		value := int64(0)
+		if priority != nil {
+			value = *priority
+		}
+		levels[value] = append(levels[value], id)
+	}
+	values := slices.SortedFunc(maps.Keys(levels), func(a, b int64) int {
+		switch {
+		case a > b:
+			return -1
+		case a < b:
+			return 1
+		default:
+			return 0
+		}
+	})
+	tiers := make([]ChannelPriorityRouteTier, 0, len(values))
+	for _, value := range values {
+		ids := levels[value]
+		slices.Sort(ids)
+		tiers = append(tiers, ChannelPriorityRouteTier{Priority: value, Channels: ids})
+	}
+	return tiers
+}
+
+func channelPriorityTiersEqual(a, b []ChannelPriorityRouteTier) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !slices.Equal(a[i].Channels, b[i].Channels) {
+			return false
+		}
+	}
+	return true
 }
 
 // Equal-priority channels remain together. Opening a slot shifts the shorter

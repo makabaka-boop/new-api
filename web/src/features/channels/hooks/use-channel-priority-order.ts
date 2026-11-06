@@ -27,7 +27,6 @@ import { getChannelPriorityOrder, reorderChannelPriority } from '../api'
 import { channelsQueryKeys } from '../lib'
 import {
   applyPriorityPreview,
-  previewPriorityDrop,
   type PriorityDrop,
   type PriorityMove,
   type PriorityOrder,
@@ -42,10 +41,13 @@ export function useChannelPriorityOrder(props: {
 }) {
   const { t } = useTranslation()
   const client = useQueryClient()
-  const [optimisticDrop, setOptimisticDrop] = useState<PriorityDrop | null>(
-    null
-  )
   const [savedPreview, setSavedPreview] = useState<PriorityOrder | null>(null)
+  // A released drag or keyboard move waits here for explicit confirmation.
+  const [pending, setPending] = useState<{
+    drop: PriorityDrop
+    order: PriorityOrder
+  } | null>(null)
+  const [preparing, setPreparing] = useState(false)
   // Only the status strip subscribes to hover/priority-preview updates. The table's
   // data and row objects stay unchanged throughout the pointer gesture.
   const [previewStore] = useState(() => {
@@ -88,7 +90,7 @@ export function useChannelPriorityOrder(props: {
     clearTimeout(timer.current)
     session.current = null
     setActive(false)
-    setOptimisticDrop(null)
+    setPending(null)
     setSavedPreview(null)
     previewStore.publish({ drop: null, preview: null, preparing: false })
   }, [previewStore])
@@ -164,7 +166,9 @@ export function useChannelPriorityOrder(props: {
     if (result.changes.length > 0) toast.success(t('Channel priorities saved'))
   }
 
-  async function commit() {
+  // Drop/keyboard release: fetch the full routing-impact preview and wait for
+  // explicit confirmation instead of saving immediately.
+  async function requestConfirm() {
     const current = session.current
     if (busy.current) return
     if (!current?.drop) {
@@ -172,22 +176,55 @@ export function useChannelPriorityOrder(props: {
       return
     }
     busy.current = true
-    setSaving(true)
+    setPreparing(true)
     clearTimeout(timer.current)
-    setOptimisticDrop(current.drop)
-    previewStore.publish({ drop: current.drop, preview: null, preparing: true })
+    previewStore.publish({ drop: null, preview: null, preparing: false })
     try {
       const snapshot = await current.snapshot
       if (session.current !== current) return
-      await save({ ...current.drop, revision: snapshot.revision })
+      const order = await reorderChannelPriority({
+        ...current.drop,
+        revision: snapshot.revision,
+        preview: true,
+        routes: true,
+      })
+      if (session.current !== current) return
+      setPending({ drop: current.drop, order })
     } catch (error) {
       handleServerError(error)
+      cancel()
+    } finally {
+      busy.current = false
+      setPreparing(false)
+    }
+  }
+
+  async function confirmSave() {
+    const current = session.current
+    const drop = pending?.drop
+    if (busy.current || !current || !drop) return
+    busy.current = true
+    setSaving(true)
+    try {
+      const snapshot = await current.snapshot
+      if (session.current !== current) return
+      await save({ ...drop, revision: snapshot.revision })
+      setPending(null)
+    } catch (error) {
+      handleServerError(error)
+      setPending(null)
       await client.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
     } finally {
       busy.current = false
       setSaving(false)
       cancel()
     }
+  }
+
+  function decline() {
+    if (busy.current) return
+    setPending(null)
+    cancel()
   }
 
   async function restore() {
@@ -230,21 +267,22 @@ export function useChannelPriorityOrder(props: {
     if (savedPreview) {
       return applyPriorityPreview(props.channels, savedPreview, props.desc)
     }
-    if (optimisticDrop) {
-      return previewPriorityDrop(props.channels, optimisticDrop, props.desc)
-    }
     return props.channels
-  }, [props.channels, props.desc, optimisticDrop, savedPreview])
+  }, [props.channels, props.desc, savedPreview])
 
   return {
     items,
     previewStore,
     active,
     saving,
+    preparing,
+    pending,
     undo,
     begin,
     select,
-    commit,
+    requestConfirm,
+    confirmSave,
+    decline,
     cancel,
     restore,
   }

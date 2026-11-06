@@ -75,6 +75,7 @@ import {
   ChannelPriorityModeToggle,
   ChannelPriorityStatus,
 } from './channel-priority-controls'
+import { ChannelPriorityConfirmDialog } from './channel-priority-confirm-dialog'
 import { ChannelPriorityDropHint } from './channel-priority-drop-hint'
 import { ChannelTypeLogo } from './channel-type-badge'
 import { useChannelsColumns } from './channels-columns'
@@ -358,11 +359,15 @@ export function ChannelsTable() {
   const drag = useChannelPriorityDrag({
     items: channels,
     desc: sortDesc,
-    enabled: reorderActive && !priorityOrder.saving && !isFetching,
+    enabled:
+      reorderActive &&
+      !priorityOrder.saving &&
+      !priorityOrder.preparing &&
+      !isFetching,
     scope: reorderScope,
     begin: priorityOrder.begin,
     select: priorityOrder.select,
-    commit: priorityOrder.commit,
+    commit: priorityOrder.requestConfirm,
     cancel: priorityOrder.cancel,
     previewStore: priorityOrder.previewStore,
   })
@@ -370,7 +375,9 @@ export function ChannelsTable() {
   if (sortField !== 'priority') dragReason = 'sort'
   else if (enableTagMode) dragReason = 'tag'
   else if (!hasPermission(user, 'channel', 'write')) dragReason = 'permission'
-  else if (priorityOrder.saving || isFetching) dragReason = 'busy'
+  else if (priorityOrder.saving || priorityOrder.preparing || isFetching) {
+    dragReason = 'busy'
+  }
 
   const dragControls = useMemo(
     () => ({ reason: dragReason, start: drag.start, keyDown: drag.keyDown }),
@@ -514,6 +521,10 @@ export function ChannelsTable() {
         )}
       <ChannelPriorityDropHint
         container={drag.feedbackContainer}
+        order={priorityOrder}
+        channels={channels}
+      />
+      <ChannelPriorityConfirmDialog
         order={priorityOrder}
         channels={channels}
       />
